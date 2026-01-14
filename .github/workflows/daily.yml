@@ -85,11 +85,15 @@ jobs:
             exit 0
           fi
 
-          # 使用 Python 脚本安全地提取标题和摘要
-          CAPTION="$(python - <<'PY'
+          echo "Found Report: $REPORT_FILE"
+
+          # === 修正点：参数必须放在 <<'PY' 之前 ===
+          CAPTION="$(python - "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" <<'PY'
           import pathlib, sys
           
+          # 此时 sys.argv[1] 就能正确获取到 $REPORT_FILE 了
           path = sys.argv[1]
+          
           try:
               text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
               lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -98,17 +102,19 @@ jobs:
               title = lines[0].lstrip("#").strip() if lines else "AI Analysis"
               
               # 2. 提取摘要 (跳过前2行：标题和图片链接)
-              # 取正文的前 800 个字符
+              # 取正文的前 850 个字符，防止超长
               body_lines = lines[2:40] 
               summary = "\n".join(body_lines)[:850]
               
+              # 3. 生成页脚链接
               link = f"Repo: {sys.argv[2]}/{sys.argv[3]}"
               
               print(f"<b>{title}</b>\n\n{summary}\n\n... <a href='https://github.com/{sys.argv[2]}/{sys.argv[3]}'>查看完整版</a>")
           except Exception as e:
+              # 如果出错，打印一个简单的 fallback 文本
               print(f"Error parsing report: {e}")
           PY
-          "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY")"
+          )"
 
           echo "发送 Telegram 通知..."
           
@@ -124,4 +130,3 @@ jobs:
               -d "parse_mode=HTML" \
               --data-urlencode "text=${CAPTION}"
           fi
-          
