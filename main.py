@@ -13,17 +13,14 @@ from sheet_manager import SheetManager
 import concurrent.futures 
 
 # ==========================================
-# 1. 数据获取模块 (智能补全 + 策略切换)
+# 1. 数据获取模块
 # ==========================================
 
 def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
-    # 强制 6 位代码补全 (处理 Excel 丢零问题)
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
-    # print(f"   -> [{symbol_code}] 正在获取数据...")
-
-    # 1. 计算时间窗口 (向前推15天)
+    # 1. 计算时间窗口
     try:
         if buy_date_str and str(buy_date_str) != 'nan' and len(str(buy_date_str)) >= 10:
             buy_dt = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
@@ -44,18 +41,16 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # 3. 数据量判断与策略切换
+    # 3. 策略切换 (数据量大时切15分钟)
     current_period = "5m"
     if len(df) > 960:
         try:
-            # 切换到 15分钟 K线
             df_15 = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="15", adjust="qfq")
             rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
             df_15 = df_15.rename(columns={k: v for k, v in rename_map.items() if k in df_15.columns})
             df = df_15.tail(960).reset_index(drop=True) 
             current_period = "15m"
         except:
-            # 失败则回退
             df = df.tail(960)
 
     # 4. 数据清洗
@@ -68,7 +63,6 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     valid_cols = [c for c in cols if c in df.columns]
     df[valid_cols] = df[valid_cols].astype(float)
 
-    # 修复开盘价为0的情况
     if "open" in df.columns and (df["open"] == 0).any():
         df["open"] = df["open"].replace(0, np.nan)
         if "close" in df.columns:
@@ -104,7 +98,7 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
         print(f"   [Error] {symbol} 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (适配 Gemini-3-Flash)
+# 3. AI 分析模块
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
@@ -124,7 +118,6 @@ def get_prompt_content(symbol, df, position_info):
                           .replace("{latest_price}", str(latest["close"])) \
                           .replace("{csv_data}", csv_data)
     
-    # 纯文本注入持仓数据
     buy_date = position_info.get('date', 'N/A')
     buy_price = position_info.get('price', 'N/A')
     qty = position_info.get('qty', 'N/A')
@@ -144,14 +137,12 @@ def call_gemini_http(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: raise ValueError("GEMINI_API_KEY missing")
     
-    # 直接信任环境变量 (如 gemini-3-flash-preview)
     model_name = os.getenv("GEMINI_MODEL") 
     if not model_name: model_name = "gemini-1.5-flash"
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
     headers = {'Content-Type': 'application/json'}
     
-    # 安全豁免设置 (关键)
     safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -166,7 +157,6 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings 
     }
     
-    # 超时设为 60s (配合并发使用)
     resp = requests.post(url, headers=headers, json=data, timeout=60)
     
     if resp.status_code != 200: 
@@ -174,7 +164,6 @@ def call_gemini_http(prompt: str) -> str:
     
     try:
         result = resp.json()
-        
         if "error" in result:
             raise Exception(f"API Error Logic: {result['error']}")
 
@@ -191,7 +180,7 @@ def call_gemini_http(prompt: str) -> str:
             raise ValueError(f"Content parts empty. FinishReason: {finish_reason}")
             
         text = parts[0].get('text', '')
-        if not text: raise ValueError("Empty text string")
+        if not text: raise ValueError("Empty text")
         
         return text
 
@@ -220,8 +209,7 @@ def ai_analyze(symbol, df, position_info):
     try: 
         return call_gemini_http(prompt)
     except Exception as e: 
-        # 自动切换 OpenAI
-        print(f"   ⚠️ [{symbol}] Gemini 失败: {e} -> 切 OpenAI")
+        print(f"   ⚠️ [{symbol}] Gemini ({os.getenv('GEMINI_MODEL')}) 失败: {e} -> 切 OpenAI")
         try: 
             return call_openai_official(prompt)
         except Exception as e2: 
@@ -265,11 +253,10 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
     except: return False
 
 # ==========================================
-# 5. 主程序 (多线程并发版)
+# 5. 主程序
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict):
-    # 补全代码
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     clean_symbol = clean_digits.zfill(6)
 
@@ -288,10 +275,9 @@ def process_one_stock(symbol: str, position_info: dict):
     beijing_tz = timezone(timedelta(hours=8))
     ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
     
-    # 💾 保存清洗后的 K线数据为 CSV (关键功能)
+    # 保存CSV
     csv_path = f"data/{clean_symbol}_{period}_{ts}.csv"
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    # print(f"   💾 CSV Saved: {csv_path}")
 
     chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
     pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
@@ -320,7 +306,7 @@ def main():
 
     generated_pdfs = []
     
-    # === 5线程并发执行 (大幅提升速度) ===
+    # 5线程并发
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_symbol = {
             executor.submit(process_one_stock, symbol, info): symbol 
@@ -337,4 +323,13 @@ def main():
                 print(f"❌ [{symbol}] 处理发生异常: {exc}")
 
     if generated_pdfs:
-        print(f"\n📝 生成推送清单 ({len(generated_
+        print(f"\n📝 生成推送清单 ({len(generated_pdfs)}):")
+        with open("push_list.txt", "w", encoding="utf-8") as f:
+            for pdf in generated_pdfs:
+                print(f"   -> {pdf}")
+                f.write(f"{pdf}\n")
+    else:
+        print("\n⚠️ 无报告生成")
+
+if __name__ == "__main__":
+    main()
