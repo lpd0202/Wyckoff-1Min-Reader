@@ -34,14 +34,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      # === 2. 安装 Python 依赖 (增加了 gspread 和 oauth2client) ===
+      # === 2. 安装 Python 依赖 ===
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 注意这里增加了 gspread oauth2client
-          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread oauth2client
+          # 👇 注意：这里删掉了 oauth2client，千万别装它！
+          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+          
       # === 3. 运行分析脚本 (连接 Google Sheets) ===
       - name: Run Analysis Script
         env:
