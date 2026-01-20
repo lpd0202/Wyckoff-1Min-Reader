@@ -21,7 +21,8 @@ def send_telegram_message(bot_token, chat_id, text):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "Markdown" # 开启 Markdown 以便支持等宽字体
     }
     try:
         requests.post(url, json=data, timeout=10)
@@ -29,48 +30,31 @@ def send_telegram_message(bot_token, chat_id, text):
         pass
 
 def parse_command(text):
-    """
-    解析指令，提取：意图(add/del), 代码, 日期, 价格, 数量
-    """
     text = text.strip()
-    
-    # 1. 提取股票代码 (6位数字)
     code_match = re.search(r"\d{6}", text)
-    if not code_match:
-        return None
+    if not code_match: return None
     code = code_match.group()
     
-    # 2. 判断意图
     intent = "add"
     if any(k in text for k in ["删除", "移除", "del", "remove", "取消"]):
         intent = "remove"
     
-    # 3. 提取其他参数 (日期、数字)
-    # 移除掉代码和关键词，剩下的部分尝试解析
     remain_text = text.replace(code, "").replace("关注", "").replace("add", "")
     
-    # 提取日期 (YYYY-MM-DD 或 YYYY/MM/DD)
     date = ""
     date_match = re.search(r"\d{4}[-/]\d{2}[-/]\d{2}", remain_text)
     if date_match:
         date = date_match.group()
-        remain_text = remain_text.replace(date, "") # 移除已识别的日期
+        remain_text = remain_text.replace(date, "")
     
-    # 提取剩下的数字 (价格、数量)
-    # 简单的按顺序：第一个浮点数是价格，第二个是数量
     nums = re.findall(r"\d+\.?\d*", remain_text)
     price = ""
     qty = ""
-    
     if len(nums) >= 1: price = nums[0]
     if len(nums) >= 2: qty = nums[1]
     
     return {
-        "intent": intent,
-        "code": code,
-        "date": date,
-        "price": price,
-        "qty": qty
+        "intent": intent, "code": code, "date": date, "price": price, "qty": qty
     }
 
 def main():
@@ -87,24 +71,12 @@ def main():
         print(f"❌ 表格连接失败: {e}")
         return
 
-    # 获取消息 (这里简化逻辑，实际生产中可能需要记录 offset 避免重复处理)
-    # 在 GitHub Actions 每次运行通常处理最新的一批
     updates = get_telegram_updates(bot_token)
-    
-    # 如果没有消息，直接退出
     if not updates:
         print("📭 无新消息")
         return
 
     print(f"📥 收到 {len(updates)} 条消息，开始处理...")
-    
-    # 只需要处理最新的几条，或者全部处理
-    # 为了避免死循环，这里假设 GitHub Actions 频率较低，
-    # 或者你需要一个机制来标记已读 (offset)。
-    # 简单起见，我们处理完消息后，不更新 offset，依赖 Telegram 的保留时长(24h)。
-    # 但这会导致重复处理。
-    # **优化**：我们只处理最近 10 分钟内的消息？或者简单处理所有 pending 的。
-    # 为了防止 GitHub Actions 重复跑，建议在 `getUpdates` 后调用一次 `getUpdates` 带上最新的 `update_id + 1` 来清除队列。
     
     max_update_id = 0
     
@@ -126,27 +98,27 @@ def main():
             print("     -> 忽略 (非指令)")
             continue
             
-        result_msg = ""
-        
+        # 1. 执行增删改操作
+        action_result = ""
         if parsed["intent"] == "remove":
-            result_msg = sm.remove_stock(parsed["code"])
+            action_result = sm.remove_stock(parsed["code"])
         else:
-            # Add or Update
             try:
-                result_msg = sm.add_or_update_stock(
-                    parsed["code"], 
-                    parsed["date"], 
-                    parsed["price"], 
-                    parsed["qty"]
+                action_result = sm.add_or_update_stock(
+                    parsed["code"], parsed["date"], parsed["price"], parsed["qty"]
                 )
             except Exception as e:
-                result_msg = f"❌ 添加失败: {e}"
+                action_result = f"❌ 操作失败: {e}"
         
-        print(f"     -> 结果: {result_msg}")
-        # 发送回执
-        send_telegram_message(bot_token, chat_id, result_msg)
+        # 2. 【关键】无论成功失败，都拉取最新的全量持仓
+        portfolio_summary = sm.get_portfolio_summary()
+        
+        # 3. 拼接最终回复
+        final_reply = f"{action_result}\n{portfolio_summary}"
+        
+        print(f"     -> 结果已发送")
+        send_telegram_message(bot_token, chat_id, final_reply)
 
-    # 清除已处理的消息 (防止下次运行重复处理)
     if max_update_id > 0:
         print(f"🧹 清理消息队列 (Offset: {max_update_id + 1})")
         get_telegram_updates(bot_token, offset=max_update_id + 1)
