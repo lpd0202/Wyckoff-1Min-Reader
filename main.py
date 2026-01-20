@@ -9,7 +9,6 @@ from openai import OpenAI
 import numpy as np
 import markdown
 from xhtml2pdf import pisa
-# 引入 Google Sheets 管理模块
 from sheet_manager import SheetManager 
 
 # ==========================================
@@ -19,27 +18,31 @@ from sheet_manager import SheetManager
 def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     """
     智能获取数据策略：
-    1. 计算 start_date = buy_date - 15天 (覆盖买入前后的走势)
-    2. 尝试获取 5分钟 K线
-    3. 如果数据行数 > 960，则改抓最近 960 根 15分钟 K线
+    1. 强制补全代码 (2641 -> 002641)
+    2. 计算 start_date = buy_date - 15天
+    3. 优先拉取 5分钟 K线，若过长则切换 15分钟
     """
-    symbol_code = ''.join(filter(str.isdigit, symbol))
+    # === 核心修复: 确保传入 AkShare 的是 6 位数字字符串 ===
+    raw_code = ''.join(filter(str.isdigit, str(symbol)))
+    symbol_code = raw_code.zfill(6)
+    
     print(f"   -> 正在分析 {symbol_code} (买入日期: {buy_date_str})...")
 
     # 1. 计算开始时间 (近似倒推15个自然日)
     try:
-        if buy_date_str and buy_date_str != 'Unknown':
-            buy_dt = datetime.strptime(buy_date_str, "%Y-%m-%d")
+        if buy_date_str and buy_date_str != 'Unknown' and len(str(buy_date_str)) >= 10:
+            # 兼容 Google Sheets 可能传来的 '2025-01-01' 或其他格式
+            buy_dt = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
             start_dt = buy_dt - timedelta(days=15) 
             start_date_em = start_dt.strftime("%Y%m%d")
         else:
-            # 如果没有买入日期，默认拉取最近15天
+            # 默认
             start_date_em = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
     except Exception as e:
         print(f"   [Warn] 日期解析失败 ({buy_date_str}), 使用默认窗口: {e}")
         start_date_em = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
 
-    # 2. 尝试拉取 5分钟 K线 (指定开始时间)
+    # 2. 尝试拉取 5分钟 K线
     try:
         df = ak.stock_zh_a_hist_min_em(
             symbol=symbol_code, 
@@ -54,24 +57,24 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # 3. 判断是否超过 960 根 (策略切换)
+    # 3. 策略判断: 数据是否过长
     current_period = "5m"
     if len(df) > 960:
         print(f"   [策略] 5分钟数据({len(df)}根)过长，切换至 15分钟 K线 (最近960根)...")
         try:
-            # 15分钟线，不限制开始时间，直接拉取，然后截取
+            # 15分钟线
             df_15 = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="15", adjust="qfq")
-            # 重命名列以确保统一
+            # 统一列名
             rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
             df_15 = df_15.rename(columns={k: v for k, v in rename_map.items() if k in df_15.columns})
             
-            df = df_15.tail(960).reset_index(drop=True) # 只取最近960根
+            df = df_15.tail(960).reset_index(drop=True) 
             current_period = "15m"
         except Exception as e:
             print(f"   [Warn] 15min接口失败，回退5min截断: {e}")
-            df = df.tail(960) # 还是用5min，但截断
+            df = df.tail(960)
 
-    # 4. 数据清洗与重命名 (确保df结构正确)
+    # 4. 数据清洗
     rename_map = {
         "时间": "date", "开盘": "open", "最高": "high",
         "最低": "low", "收盘": "close", "成交量": "volume"
@@ -83,7 +86,6 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
 
     # 修复 Open=0
     if (df["open"] == 0).any():
-        print(f"   [清洗] 修复 Open=0 数据...")
         df["open"] = df["open"].replace(0, np.nan)
         df["open"] = df["open"].fillna(df["close"].shift(1))
         df["open"] = df["open"].fillna(df["close"])
@@ -125,27 +127,21 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
     if 'ma200' in plot_df.columns:
         apds.append(mpf.make_addplot(plot_df['ma200'], color='#2196f3', width=2.0))
 
-    title_text = f"Wyckoff Setup: {symbol} ({period})"
-    
     try:
         mpf.plot(
             plot_df, type='candle', style=s, addplot=apds, volume=True,
-            title=title_text,
+            title=f"Wyckoff Setup: {symbol} ({period})",
             savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'),
             warn_too_much_data=2000
         )
-        print(f"   [OK] 图表已保存")
     except Exception as e:
         print(f"   [Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (持仓感知版)
+# 3. AI 分析模块
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
-    """
-    position_info: {'date': '...', 'qty': '...', 'price': '...'}
-    """
     prompt_template = os.getenv("WYCKOFF_PROMPT_TEMPLATE")
     if not prompt_template and os.path.exists("prompt_secret.txt"):
         try:
@@ -158,7 +154,7 @@ def get_prompt_content(symbol, df, position_info):
     latest = df.iloc[-1]
     current_price = float(latest["close"])
     
-    # === 新增：计算持仓盈亏并注入 Prompt ===
+    # === 持仓盈亏注入 ===
     try:
         buy_price = float(position_info.get('price', 0))
         buy_date = position_info.get('date', 'Unknown')
@@ -174,19 +170,16 @@ def get_prompt_content(symbol, df, position_info):
             f"- Buy Date: {buy_date}\n"
             f"- Buy Price: {buy_price}\n"
             f"- Current PnL: {sign}{pnl_pct:.2f}%\n"
-            f"IMPORTANT: The user currently holds this position. "
-            f"Please give specific advice based on the profit/loss status (e.g., set stop loss, take profit, or hold)."
+            f"IMPORTANT: The user holds this position. Advice on Hold/Sell/Stop-Loss?"
         )
     else:
-        position_context = "\n\n[USER POSITION INFO]\nUser is watching this stock but has NO open position yet."
+        position_context = "\n\n[USER POSITION INFO]\nNo open position. Advice on Buy/Wait?"
 
-    # 替换模板变量
     final_prompt = prompt_template.replace("{symbol}", symbol) \
                           .replace("{latest_time}", str(latest["date"])) \
                           .replace("{latest_price}", str(latest["close"])) \
                           .replace("{csv_data}", csv_data)
     
-    # 将持仓信息附加到最后
     return final_prompt + position_context
 
 def call_gemini_http(prompt: str) -> str:
@@ -199,17 +192,15 @@ def call_gemini_http(prompt: str) -> str:
     headers = {'Content-Type': 'application/json'}
     data = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "system_instruction": {"parts": [{"text": "You are Richard D. Wyckoff. You follow strict Wyckoff logic."}]},
+        "system_instruction": {"parts": [{"text": "You are Richard D. Wyckoff."}]},
         "generationConfig": {"temperature": 0.2}
     }
     resp = requests.post(url, headers=headers, json=data)
-    if resp.status_code != 200: raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
-    
-    # 安全获取响应内容
+    if resp.status_code != 200: raise Exception(f"Gemini API Error: {resp.text}")
     try:
         return resp.json()['candidates'][0]['content']['parts'][0]['text']
-    except Exception as e:
-        raise Exception(f"Gemini 响应解析失败: {resp.text}")
+    except:
+        return f"Gemini Parsing Error. Raw: {resp.text}"
 
 def call_openai_official(prompt: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -256,22 +247,19 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
             h1, h2, h3, p, div {{ font-family: "MyChineseFont", sans-serif; color: #2c3e50; }}
             img {{ width: 18cm; margin-bottom: 20px; }}
             .header {{ text-align: center; margin-bottom: 20px; color: #7f8c8d; font-size: 10px; }}
-            pre {{ background: #f4f4f4; padding: 10px; border-radius: 5px; }}
         </style>
     </head>
     <body>
-        <div class="header">Wyckoff Quantitative Analysis Report | Generated by AI Agent</div>
+        <div class="header">Wyckoff Quantitative Analysis | {symbol}</div>
         <img src="{abs_chart_path}" />
         <hr/>
         {html_content}
-        <div style="text-align:right; color:#bdc3c7; font-size:8px;">Target: {symbol} | Data: EastMoney</div>
     </body>
     </html>
     """
     try:
         with open(pdf_path, "wb") as pdf_file:
             pisa.CreatePDF(full_html, dest=pdf_file)
-        print(f"   [OK] PDF Generated: {pdf_path}")
         return True
     except Exception as e:
         print(f"   [Error] PDF 生成失败: {e}")
@@ -282,15 +270,8 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict, generated_files: list):
-    """
-    symbol: 股票代码
-    position_info: {'date': '2025-01-01', 'qty': '100', 'price': '10.5'}
-    """
-    print(f"\n{'='*40}")
-    print(f"🚀 开始分析: {symbol}")
-    print(f"{'='*40}")
+    print(f"\n{'='*40}\n🚀 开始分析: {symbol}\n{'='*40}")
 
-    # 1. 动态拉取数据 (5m 或 15m) - 传入买入日期
     data_res = fetch_stock_data_dynamic(symbol, position_info.get('date'))
     df = data_res["df"]
     period = data_res["period"]
@@ -300,40 +281,29 @@ def process_one_stock(symbol: str, position_info: dict, generated_files: list):
         return
     df = add_indicators(df)
 
-    # 2. 生成文件名 (北京时间) + 增加周期标识
+    # 文件名生成
     beijing_tz = timezone(timedelta(hours=8))
     ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
     
-    # 文件名增加 _{period}_ 标识
-    csv_path = f"data/{symbol}_{period}_{ts}.csv"
-    chart_path = f"reports/{symbol}_chart_{ts}.png"
-    pdf_path = f"reports/{symbol}_report_{period}_{ts}.pdf"
+    # 强制补全 symbol 以防万一
+    clean_symbol = str(symbol).strip().zfill(6)
     
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
+    pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
     
-    # 画图时传入 period 标题
-    generate_local_chart(symbol, df, chart_path, period)
+    generate_local_chart(clean_symbol, df, chart_path, period)
+    report_text = ai_analyze(clean_symbol, df, position_info)
     
-    # 3. AI 分析 (传入持仓信息)
-    report_text = ai_analyze(symbol, df, position_info)
-    
-    # 4. 生成 PDF
-    if generate_pdf_report(symbol, chart_path, report_text, pdf_path):
+    if generate_pdf_report(clean_symbol, chart_path, report_text, pdf_path):
         generated_files.append(pdf_path)
     
-    # 调试用 MD (修复了这里的闭合问题)
-    md_path = f"reports/{symbol}_report_{ts}.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-    
-    print(f"✅ {symbol} 处理完成")
+    print(f"✅ {clean_symbol} 处理完成")
 
 def main():
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
 
-    print("☁️ 正在连接 Google Sheets 获取持仓列表...")
-    
+    print("☁️ 正在连接 Google Sheets...")
     try:
         sm = SheetManager()
         stocks_dict = sm.get_all_stocks()
@@ -346,7 +316,6 @@ def main():
         print("⚠️ 列表为空，结束。")
         return
 
-    # 2. 循环处理
     generated_pdfs = []
     
     for i, (symbol, info) in enumerate(stocks_dict.items()):
@@ -355,11 +324,9 @@ def main():
         except Exception as e:
             print(f"❌ {symbol} 错误: {e}")
         
-        # 防止接口限流
         if i < len(stocks_dict) - 1:
-            time.sleep(10)
+            time.sleep(5)
 
-    # 3. 生成推送清单
     if generated_pdfs:
         print(f"\n📝 生成推送清单 ({len(generated_pdfs)} 个文件):")
         with open("push_list.txt", "w", encoding="utf-8") as f:
@@ -367,7 +334,7 @@ def main():
                 print(f"   -> {pdf}")
                 f.write(f"{pdf}\n")
     else:
-        print("\n⚠️ 本次没有生成任何 PDF，不创建 push_list.txt")
+        print("\n⚠️ 本次没有生成任何 PDF")
 
 if __name__ == "__main__":
     main()
