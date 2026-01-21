@@ -1,10 +1,7 @@
-akshare
-pandas
-openai
-python-dotenv
-mplfinance
-gspread
-xhtml2pdf
-markdown
-requests
-
+requests>=2.31.0
+akshare>=1.10.48
+mplfinance>=0.12.10b0
+pandas>=2.1.4
+gspread>=5.12.0
+oauth2client>=4.1.3
+fpdf>=1.7.2
