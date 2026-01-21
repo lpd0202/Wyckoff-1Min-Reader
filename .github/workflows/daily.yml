@@ -1,104 +1,43 @@
 name: Daily Stock AI Report
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 4 * * *"   # 北京时间 12:00
-    - cron: "15 7 * * *"  # 北京时间 15:15
-
-permissions:
-  contents: write
-
-concurrency:
-  group: stock-ai-report-main
-  cancel-in-progress: true
+    - cron: '0 4 * * 1-5'  # 北京时间12:00（UTC+8），周一到周五
+  workflow_dispatch:  # 手动触发
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-wqy-microhei ttf-wqy-microhei libcairo2-dev pkg-config python3-dev
-          fc-cache -f -v
-
-      - name: Setup Python
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
+          python-version: '3.11'
+      
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread google-auth
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run Analysis Script
+          pip install -r requirements.txt
+      
+      - name: Run main script
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # 👇 【已更新】指定为 gemini-3-flash-preview
-          GEMINI_MODEL: "gemini-3-flash-preview"
-          
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          AI_MODEL: "gpt-4o"
-          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
-          BARS_COUNT: "600"
+          # 原有环境变量（保留）
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
-        run: |
-          mkdir -p data reports
-          python main.py
-
-      - name: Cleanup old data
-        run: |
-          echo "Cleaning up files older than 7 days..."
-          find reports/ -name "*.*" -type f -mtime +7 -print -delete
-          find data/ -name "*.csv" -type f -mtime +7 -print -delete
-
-      - name: Commit and push changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add --all
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: daily report $(date +'%Y-%m-%d')"
-            git pull --rebase origin main
-            git push origin HEAD:main
-          fi
-
-      - name: Notify Telegram (Push List)
-        if: success()
-        env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        shell: bash
+          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
+          # 新增：DeepSeek密钥（从GitHub Secrets中读取）
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
-          set -u
-          if [ ! -f push_list.txt ]; then
-            echo "::warning::File push_list.txt not found."
-            exit 0
-          fi
-          
-          echo "=== Start Pushing ==="
-          while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
-            PDF_FILE=$(echo "$PDF_FILE" | xargs)
-            if [ -n "$PDF_FILE" ] && [ -f "$PDF_FILE" ]; then
-              echo "Sending: $PDF_FILE"
-              FILENAME=$(basename "$PDF_FILE")
-              CAPTION="Analysis: $FILENAME"
-              
-              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" -F "chat_id=${TG_CHAT_ID}" -F "document=@$PDF_FILE" -F "caption=$CAPTION"
-                
-              echo "Sent."
-              sleep 3
-            fi
-          done < push_list.txt
-          echo "=== Finished ==="
+          python main.py
+      
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-reports
+          path: reports/
