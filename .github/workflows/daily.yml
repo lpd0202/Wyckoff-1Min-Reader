@@ -16,6 +16,12 @@ jobs:
         with:
           python-version: '3.11'
       
+      # 新增：安装系统级依赖（解决pycairo需要的cairo库）
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev pkg-config  # 关键：安装cairo和pkg-config
+      
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -31,7 +37,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
-          # 新增：DeepSeek密钥（从GitHub Secrets中读取）
+          # 新增：DeepSeek密钥
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           python main.py
