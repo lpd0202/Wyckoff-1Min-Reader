@@ -1,262 +1,250 @@
 import os
 import time
 import json
-import requests
 import akshare as ak
-import mplfinance as mpf
 import pandas as pd
+import mplfinance as mpf
+import requests
 from datetime import datetime, timedelta
+from telegram import Bot
+from telegram.error import TelegramError
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from fpdf import FPDF
+import openai
 
-# ===================== 全局配置 =====================
-# 轨迹流动 API 配置
-SILICONFLOW_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 对应你之前配置的Secret名称
-SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V3.1-Terminus"
+# ====================== 全局配置 ======================
+# 环境变量（建议通过 GitHub Secrets 配置）
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_SHEETS_CRED_JSON = os.getenv("GOOGLE_SHEETS_CRED_JSON")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # Google Sheets ID（优先）
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")  # 备选：表格文件名
 
-# Google Sheets 配置
-GOOGLE_CREDENTIALS = json.loads(os.getenv("GCP_SA_KEY"))  # 对应原Secret名称
-SPREADSHEET_ID = os.getenv("SHEET_NAME")  # 对应原Secret名称
+# AI 配置
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent"
+OPENAI_BASE_URL = "https://api.openai.com/v1/chat/completions"
+TIMEOUT_SECONDS = 120
+WYCKOFF_PROMPT_TEMPLATE = """
+请基于以下A股{stock_code}（{stock_name}）的{period}分钟K线数据，按照威科夫（Wyckoff）理论分析：
+1. 识别是否存在Spring（弹簧效应）、UT（上冲回落）、LPS（最后支撑点）等关键行为；
+2. 分析供求关系和主力资金动向（吸筹/派发）；
+3. 结合持仓成本{cost_price}、持仓数量{hold_num}、买入日期{buy_date}，给出明确的操作建议（Hold/Sell/Stop-Loss）；
+4. 输出格式要求：分点说明，逻辑清晰，结论明确。
 
-# 全局参数
-TIMEOUT = 120  # API 请求超时时间
-STOCK_CODE_ZFILL = 6  # 股票代码补零位数
-ANALYSIS_WINDOW_DAYS = 15  # 分析窗口天数
-OUTPUT_DIR = "reports"  # 报告输出目录
+K线数据：
+{klines_data}
+"""
 
-# 确保输出目录存在
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ===================== 工具函数 =====================
-def format_stock_code(stock_code: str) -> str:
-    """补全股票代码为6位（处理Excel/Sheets丢零问题）"""
-    return str(stock_code).zfill(STOCK_CODE_ZFILL)
-
-def get_google_sheets_data() -> pd.DataFrame:
-    """从Google Sheets读取持仓/关注列表"""
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDENTIALS, scope)
-    client = gspread.authorize(creds)
-    
-    # 连接表格（优先ID，兼容文件名）
+# ====================== 工具函数 ======================
+def init_google_sheets():
+    """初始化Google Sheets连接"""
     try:
-        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-    except:
-        sheet = client.open(SPREADSHEET_ID).sheet1
-    
-    # 读取数据并转为DataFrame
-    data = sheet.get_all_records()
-    df = pd.DataFrame(data)
-    # 补全股票代码
-    if "股票代码" in df.columns:
-        df["股票代码"] = df["股票代码"].apply(format_stock_code)
-    return df
-
-def fetch_stock_data_dynamic(stock_code: str, buy_date: str = None) -> pd.DataFrame:
-    """
-    智能获取股票K线数据
-    :param stock_code: 6位股票代码
-    :param buy_date: 买入日期（格式YYYY-MM-DD），为空则取最新数据
-    :return: 标准化的K线DataFrame
-    """
-    # 计算分析窗口起始时间
-    if buy_date:
-        start_date = (datetime.strptime(buy_date, "%Y-%m-%d") - timedelta(days=ANALYSIS_WINDOW_DAYS)).strftime("%Y%m%d")
-    else:
-        start_date = (datetime.now() - timedelta(days=ANALYSIS_WINDOW_DAYS)).strftime("%Y%m%d")
-    end_date = datetime.now().strftime("%Y%m%d")
-
-    # 优先获取5分钟K线，兼容1分钟数据
-    try:
-        # AkShare获取A股5分钟K线
-        stock_df = ak.stock_zh_a_hist_min_em(
-            symbol=stock_code,
-            period="5",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq"
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            json.loads(GOOGLE_SHEETS_CRED_JSON),
+            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         )
+        client = gspread.authorize(creds)
+        if SPREADSHEET_ID:
+            sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+        else:
+            sheet = client.open(SPREADSHEET_NAME).sheet1
+        return sheet
     except Exception as e:
-        # 降级获取1分钟K线
-        stock_df = ak.stock_zh_a_hist_min_em(
+        raise Exception(f"Google Sheets初始化失败: {str(e)}")
+
+def get_stock_list_from_sheets():
+    """从Google Sheets获取持仓列表"""
+    sheet = init_google_sheets()
+    data = sheet.get_all_records()
+    # 数据清洗：补全股票代码6位、过滤空值
+    stock_list = []
+    for row in data:
+        stock_code = str(row.get("股票代码", "")).zfill(6)
+        if not stock_code or stock_code == "000000":
+            continue
+        stock_list.append({
+            "code": stock_code,
+            "name": row.get("股票名称", ""),
+            "buy_date": row.get("买入日期", ""),
+            "cost": row.get("持仓成本", 0.0),
+            "num": row.get("持仓数量", 0)
+        })
+    return stock_list
+
+def fetch_stock_data_dynamic(stock_code, buy_date=None):
+    """智能获取K线数据（优先5分钟，补全代码，回溯时间窗口）"""
+    # 代码归一化：强制补全6位
+    stock_code = stock_code.zfill(6)
+    try:
+        # 计算回溯窗口：买入日期前15天（无则默认近30天）
+        end_date = datetime.now().strftime("%Y%m%d")
+        if buy_date:
+            buy_dt = datetime.strptime(buy_date, "%Y-%m-%d")
+            start_date = (buy_dt - timedelta(days=15)).strftime("%Y%m%d")
+        else:
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+        
+        # 优先获取5分钟K线
+        df = ak.stock_zh_a_hist_min_em(
             symbol=stock_code,
-            period="1",
+            period="5",  # 5分钟级别
             start_date=start_date,
             end_date=end_date,
             adjust="qfq"
         )
+        if df.empty:
+            # 降级到1分钟K线
+            df = ak.stock_zh_a_hist_min_em(
+                symbol=stock_code,
+                period="1",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq"
+            )
+        
+        # 数据格式化
+        df.rename(columns={
+            "时间": "datetime", "开盘": "open", "最高": "high",
+            "最低": "low", "收盘": "close", "成交量": "volume"
+        }, inplace=True)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df.set_index("datetime", inplace=True)
+        return df
+    except Exception as e:
+        raise Exception(f"获取{stock_code}K线数据失败: {str(e)}")
 
-    # 数据标准化
-    stock_df.rename(
-        columns={
-            "时间": "datetime",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume"
-        },
-        inplace=True
+def generate_wyckoff_analysis(stock_info, kline_df):
+    """双AI引擎分析威科夫结构"""
+    # 构造Prompt
+    prompt = WYCKOFF_PROMPT_TEMPLATE.format(
+        stock_code=stock_info["code"],
+        stock_name=stock_info["name"],
+        period=kline_df.index.inferred_freq.split("T")[0] if kline_df.index.inferred_freq else "5",
+        klines_data=kline_df.tail(100).to_string(),  # 取最近100根K线
+        cost_price=stock_info["cost"],
+        hold_num=stock_info["num"],
+        buy_date=stock_info["buy_date"]
     )
-    stock_df["datetime"] = pd.to_datetime(stock_df["datetime"])
-    stock_df.set_index("datetime", inplace=True)
-    return stock_df
 
-def plot_kline(stock_df: pd.DataFrame, stock_code: str, save_path: str):
-    """绘制高对比K线图并保存"""
-    # 红绿配色（符合A股习惯）
+    # 1. 尝试Gemini引擎
+    try:
+        gemini_headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+        }
+        gemini_data = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "safetySettings": [{"category": "HARM_CATEGORY_ALL", "threshold": "BLOCK_NONE"}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2000}
+        }
+        gemini_resp = requests.post(
+            f"{GEMINI_BASE_URL}?key={GEMINI_API_KEY}",
+            json=gemini_data,
+            timeout=TIMEOUT_SECONDS
+        )
+        gemini_resp.raise_for_status()
+        gemini_result = gemini_resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        if gemini_result.strip():
+            return "【Gemini分析结果】\n" + gemini_result
+    except Exception as e:
+        print(f"Gemini分析失败: {str(e)}")
+
+    # 2. 降级到GPT-4o
+    try:
+        openai.api_key = OPENAI_API_KEY
+        gpt_resp = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            timeout=TIMEOUT_SECONDS
+        )
+        gpt_result = gpt_resp.choices[0].message["content"]
+        return "【GPT-4o分析结果（Gemini降级）】\n" + gpt_result
+    except Exception as e:
+        raise Exception(f"双AI引擎均失败: {str(e)}")
+
+def plot_kline(stock_code, kline_df, save_path="kline_chart.png"):
+    """绘制高对比K线图"""
+    # 红绿配色（适配威科夫分析视觉）
     mc = mpf.make_marketcolors(up="red", down="green", inherit=True)
     s = mpf.make_mpf_style(marketcolors=mc, figratio=(12, 8), figscale=1.2)
     
     # 绘制K线
     mpf.plot(
-        stock_df,
+        kline_df.tail(50),  # 最近50根K线
         type="candle",
-        volume=True,
         style=s,
-        title=f"{stock_code} Wyckoff 结构分析",
+        title=f"{stock_code} 威科夫分析K线",
         ylabel="价格 (¥)",
-        ylabel_lower="成交量",
+        volume=True,
         savefig=save_path
     )
+    return save_path
 
-def deepseek_ai_analysis(stock_data_str: str, position_info: str) -> str:
-    """
-    调用轨迹流动DeepSeek模型进行威科夫结构分析
-    :param stock_data_str: 股票K线数据文本
-    :param position_info: 持仓信息（成本/数量/买入日期）
-    :return: AI分析结论
-    """
-    # 构建威科夫分析Prompt
-    system_prompt = """
-    你是专业的威科夫（Wyckoff）交易策略分析师，精通A股1分钟/5分钟微观结构分析。
-    请基于提供的股票K线数据和持仓信息，完成以下分析：
-    1. 识别供求关系变化，标注Spring（弹簧效应）、UT（上冲回落）、LPS（最后支撑点）等关键行为；
-    2. 结合用户持仓成本/买入日期，给出明确的操作建议（Hold/Sell/Stop-Loss）及止损位；
-    3. 分析过程需基于威科夫核心理论，拒绝情绪化、模糊化表述；
-    4. 输出语言为中文，结构清晰，优先标注关键信号，再给出建议。
-    """
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"### 股票数据：\n{stock_data_str}\n### 持仓信息：\n{position_info}"}
-    ]
-
-    # 构造请求体
-    payload = {
-        "model": DEEPSEEK_MODEL,
-        "messages": messages,
-        "temperature": 0.1,  # 低随机性保证分析稳定
-        "max_tokens": 2000
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {SILICONFLOW_API_KEY}"
-    }
-
-    # 发送请求
+def send_telegram_message(content, image_path=None):
+    """发送消息/图片到Telegram"""
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try:
-        response = requests.post(
-            SILICONFLOW_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=TIMEOUT
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        raise Exception(f"DeepSeek API 调用失败: {str(e)}")
+        # 发送文本
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content, parse_mode="Markdown")
+        # 发送图片（K线图）
+        if image_path and os.path.exists(image_path):
+            with open(image_path, "rb") as f:
+                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=f)
+    except TelegramError as e:
+        raise Exception(f"Telegram推送失败: {str(e)}")
 
-def generate_pdf_report(analysis_result: str, kline_img_path: str, report_path: str):
-    """生成包含分析结论和K线图的PDF研报"""
-    pdf = FPDF()
-    pdf.add_page()
-    
-    # 设置字体（需确保环境有中文字体，GitHub Actions的Ubuntu可安装wqy-microhei）
-    pdf.add_font("SimHei", "", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", uni=True)
-    pdf.set_font("SimHei", size=12)
-    
-    # 添加标题
-    pdf.cell(200, 10, txt="Wyckoff-M1-Sentinel 量化分析报告", ln=True, align="C")
-    pdf.ln(10)
-    
-    # 添加分析内容
-    pdf.multi_cell(0, 10, txt=analysis_result)
-    pdf.ln(5)
-    
-    # 添加K线图
-    if os.path.exists(kline_img_path):
-        pdf.image(kline_img_path, x=10, y=pdf.get_y(), w=180)
-    
-    # 保存PDF
-    pdf.output(report_path)
-
-# ===================== 核心业务逻辑 =====================
-def analyze_single_stock(stock_code: str, position_info: dict):
-    """分析单只股票并生成报告"""
+# ====================== 主流程 ======================
+def main():
+    """主执行函数"""
+    print(f"===== 威科夫分析任务启动 {datetime.now()} =====")
     try:
-        # 1. 获取股票数据
-        stock_df = fetch_stock_data_dynamic(
-            stock_code=stock_code,
-            buy_date=position_info.get("买入日期")
-        )
-        if stock_df.empty:
-            print(f"⚠️ {stock_code} 未获取到有效K线数据")
+        # 1. 获取持仓列表
+        stock_list = get_stock_list_from_sheets()
+        if not stock_list:
+            print("未从Google Sheets获取到持仓数据")
+            send_telegram_message("⚠️ 未检测到持仓数据，任务终止")
             return
-        
-        # 2. 绘制K线图
-        kline_img_path = os.path.join(OUTPUT_DIR, f"{stock_code}_kline.png")
-        plot_kline(stock_df, stock_code, kline_img_path)
-        
-        # 3. 格式化数据供AI分析
-        stock_data_str = stock_df.tail(100).to_string()  # 取最新100条数据
-        position_info_str = json.dumps(position_info, ensure_ascii=False, indent=2)
-        
-        # 4. DeepSeek AI分析
-        print(f"🧠 正在分析 {stock_code}...")
-        analysis_result = deepseek_ai_analysis(stock_data_str, position_info_str)
-        
-        # 5. 生成PDF报告
-        report_path = os.path.join(OUTPUT_DIR, f"{stock_code}_wyckoff_report.pdf")
-        generate_pdf_report(analysis_result, kline_img_path, report_path)
-        
-        print(f"✅ {stock_code} 分析完成，报告已保存至：{report_path}")
-        
-    except Exception as e:
-        print(f"❌ {stock_code} 分析失败：{str(e)}")
 
-def batch_analyze_stocks():
-    """批量分析Google Sheets中的股票"""
-    try:
-        # 读取持仓列表
-        stock_df = get_google_sheets_data()
-        if stock_df.empty:
-            print("⚠️ Google Sheets 未读取到持仓数据")
-            return
-        
-        print(f"📋 开始分析 {len(stock_df)} 只股票...")
-        # 遍历分析每只股票
-        for _, row in stock_df.iterrows():
-            position_info = {
-                "股票代码": row.get("股票代码"),
-                "买入日期": row.get("买入日期"),
-                "持仓成本": row.get("持仓成本"),
-                "持仓数量": row.get("持仓数量")
-            }
-            analyze_single_stock(
-                stock_code=position_info["股票代码"],
-                position_info=position_info
-            )
-            # 避免API限流
-            time.sleep(5)
+        # 2. 遍历分析每只股票
+        for stock in stock_list:
+            print(f"\n分析股票: {stock['code']} - {stock['name']}")
+            # 获取K线数据
+            kline_df = fetch_stock_data_dynamic(stock["code"], stock["buy_date"])
+            if kline_df.empty:
+                send_telegram_message(f"❌ {stock['code']} {stock['name']} 未获取到K线数据")
+                continue
             
-    except Exception as e:
-        print(f"❌ 批量分析失败：{str(e)}")
+            # 生成威科夫分析
+            analysis_result = generate_wyckoff_analysis(stock, kline_df)
+            
+            # 绘制K线图
+            kline_path = f"{stock['code']}_kline.png"
+            plot_kline(stock["code"], kline_df, kline_path)
+            
+            # 推送结果到Telegram
+            msg = f"""
+📈 【{stock['code']} {stock['name']} 威科夫分析报告】
+📅 买入日期: {stock['buy_date'] or '无'}
+💰 持仓成本: ¥{stock['cost']}
+📊 分析结论:
+{analysis_result}
+            """
+            send_telegram_message(msg, kline_path)
+            
+            # 清理临时文件
+            if os.path.exists(kline_path):
+                os.remove(kline_path)
 
-# ===================== 主入口 =====================
+        print(f"\n===== 任务完成 {datetime.now()} =====")
+        send_telegram_message("✅ 所有持仓股票分析完成，报告已推送")
+
+    except Exception as e:
+        error_msg = f"❌ 任务执行失败: {str(e)}"
+        print(error_msg)
+        send_telegram_message(error_msg)
+
 if __name__ == "__main__":
-    batch_analyze_stocks()
+    main()
