@@ -1,250 +1,461 @@
 import os
 import time
-import json
-import akshare as ak
-import pandas as pd
-import mplfinance as mpf
 import requests
-from datetime import datetime, timedelta
-from telegram import Bot
-from telegram.error import TelegramError
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import openai
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+import akshare as ak
+import mplfinance as mpf
+from openai import OpenAI
+import numpy as np
+import markdown
+from xhtml2pdf import pisa
+from sheet_manager import SheetManager
+import json
+import random
+import re
+from typing import Optional
 
-# ====================== 全局配置 ======================
-# 环境变量（建议通过 GitHub Secrets 配置）
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_SHEETS_CRED_JSON = os.getenv("GOOGLE_SHEETS_CRED_JSON")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")  # Google Sheets ID（优先）
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")  # 备选：表格文件名
-
-# AI 配置
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent"
-OPENAI_BASE_URL = "https://api.openai.com/v1/chat/completions"
-TIMEOUT_SECONDS = 120
-WYCKOFF_PROMPT_TEMPLATE = """
-请基于以下A股{stock_code}（{stock_name}）的{period}分钟K线数据，按照威科夫（Wyckoff）理论分析：
-1. 识别是否存在Spring（弹簧效应）、UT（上冲回落）、LPS（最后支撑点）等关键行为；
-2. 分析供求关系和主力资金动向（吸筹/派发）；
-3. 结合持仓成本{cost_price}、持仓数量{hold_num}、买入日期{buy_date}，给出明确的操作建议（Hold/Sell/Stop-Loss）；
-4. 输出格式要求：分点说明，逻辑清晰，结论明确。
-
-K线数据：
-{klines_data}
-"""
-
-# ====================== 工具函数 ======================
-def init_google_sheets():
-    """初始化Google Sheets连接"""
+# ==========================================
+# 0) 保留原Gemini相关代码（作为备用，不删除）
+# ==========================================
+class GeminiQuotaExceeded(Exception):
+    """按天/按项目配额耗尽：等待无效，应切 OpenAI。"""
+    pass
+class GeminiRateLimited(Exception):
+    """短期速率限制：可退避重试。"""
+    pass
+def _extract_retry_seconds(resp: requests.Response) -> int:
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1, int(float(ra)))
+        except:
+            pass
+    text = resp.text or ""
+    m = re.search(r"retry in\s+([\d\.]+)\s*s", text, re.IGNORECASE)
+    if m:
+        return max(1, int(float(m.group(1))))
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            json.loads(GOOGLE_SHEETS_CRED_JSON),
-            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        )
-        client = gspread.authorize(creds)
-        if SPREADSHEET_ID:
-            sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-        else:
-            sheet = client.open(SPREADSHEET_NAME).sheet1
-        return sheet
-    except Exception as e:
-        raise Exception(f"Google Sheets初始化失败: {str(e)}")
-
-def get_stock_list_from_sheets():
-    """从Google Sheets获取持仓列表"""
-    sheet = init_google_sheets()
-    data = sheet.get_all_records()
-    # 数据清洗：补全股票代码6位、过滤空值
-    stock_list = []
-    for row in data:
-        stock_code = str(row.get("股票代码", "")).zfill(6)
-        if not stock_code or stock_code == "000000":
-            continue
-        stock_list.append({
-            "code": stock_code,
-            "name": row.get("股票名称", ""),
-            "buy_date": row.get("买入日期", ""),
-            "cost": row.get("持仓成本", 0.0),
-            "num": row.get("持仓数量", 0)
-        })
-    return stock_list
-
-def fetch_stock_data_dynamic(stock_code, buy_date=None):
-    """智能获取K线数据（优先5分钟，补全代码，回溯时间窗口）"""
-    # 代码归一化：强制补全6位
-    stock_code = stock_code.zfill(6)
+        obj = resp.json()
+        msg = ((obj.get("error", {}) or {}).get("message", "") or "")
+        m2 = re.search(r"retry in\s+([\d\.]+)\s*s", msg, re.IGNORECASE)
+        if m2:
+            return max(1, int(float(m2.group(1))))
+    except:
+        pass
+    return 0
+def _is_quota_exhausted(resp: requests.Response) -> bool:
+    text = (resp.text or "").lower()
+    if ("quota exceeded" in text) or ("exceeded your current quota" in text):
+        return True
+    if ("free_tier" in text) and ("limit" in text):
+        return True
     try:
-        # 计算回溯窗口：买入日期前15天（无则默认近30天）
-        end_date = datetime.now().strftime("%Y%m%d")
-        if buy_date:
-            buy_dt = datetime.strptime(buy_date, "%Y-%m-%d")
-            start_date = (buy_dt - timedelta(days=15)).strftime("%Y%m%d")
-        else:
-            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
-        
-        # 优先获取5分钟K线
-        df = ak.stock_zh_a_hist_min_em(
-            symbol=stock_code,
-            period="5",  # 5分钟级别
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq"
-        )
-        if df.empty:
-            # 降级到1分钟K线
-            df = ak.stock_zh_a_hist_min_em(
-                symbol=stock_code,
-                period="1",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-        
-        # 数据格式化
-        df.rename(columns={
-            "时间": "datetime", "开盘": "open", "最高": "high",
-            "最低": "low", "收盘": "close", "成交量": "volume"
-        }, inplace=True)
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df.set_index("datetime", inplace=True)
-        return df
-    except Exception as e:
-        raise Exception(f"获取{stock_code}K线数据失败: {str(e)}")
-
-def generate_wyckoff_analysis(stock_info, kline_df):
-    """双AI引擎分析威科夫结构"""
-    # 构造Prompt
-    prompt = WYCKOFF_PROMPT_TEMPLATE.format(
-        stock_code=stock_info["code"],
-        stock_name=stock_info["name"],
-        period=kline_df.index.inferred_freq.split("T")[0] if kline_df.index.inferred_freq else "5",
-        klines_data=kline_df.tail(100).to_string(),  # 取最近100根K线
-        cost_price=stock_info["cost"],
-        hold_num=stock_info["num"],
-        buy_date=stock_info["buy_date"]
-    )
-
-    # 1. 尝试Gemini引擎
-    try:
-        gemini_headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY
-        }
-        gemini_data = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "safetySettings": [{"category": "HARM_CATEGORY_ALL", "threshold": "BLOCK_NONE"}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2000}
-        }
-        gemini_resp = requests.post(
-            f"{GEMINI_BASE_URL}?key={GEMINI_API_KEY}",
-            json=gemini_data,
-            timeout=TIMEOUT_SECONDS
-        )
-        gemini_resp.raise_for_status()
-        gemini_result = gemini_resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        if gemini_result.strip():
-            return "【Gemini分析结果】\n" + gemini_result
-    except Exception as e:
-        print(f"Gemini分析失败: {str(e)}")
-
-    # 2. 降级到GPT-4o
-    try:
-        openai.api_key = OPENAI_API_KEY
-        gpt_resp = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            timeout=TIMEOUT_SECONDS
-        )
-        gpt_result = gpt_resp.choices[0].message["content"]
-        return "【GPT-4o分析结果（Gemini降级）】\n" + gpt_result
-    except Exception as e:
-        raise Exception(f"双AI引擎均失败: {str(e)}")
-
-def plot_kline(stock_code, kline_df, save_path="kline_chart.png"):
-    """绘制高对比K线图"""
-    # 红绿配色（适配威科夫分析视觉）
-    mc = mpf.make_marketcolors(up="red", down="green", inherit=True)
-    s = mpf.make_mpf_style(marketcolors=mc, figratio=(12, 8), figscale=1.2)
-    
-    # 绘制K线
-    mpf.plot(
-        kline_df.tail(50),  # 最近50根K线
-        type="candle",
-        style=s,
-        title=f"{stock_code} 威科夫分析K线",
-        ylabel="价格 (¥)",
-        volume=True,
-        savefig=save_path
-    )
-    return save_path
-
-def send_telegram_message(content, image_path=None):
-    """发送消息/图片到Telegram"""
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    try:
-        # 发送文本
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content, parse_mode="Markdown")
-        # 发送图片（K线图）
-        if image_path and os.path.exists(image_path):
-            with open(image_path, "rb") as f:
-                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=f)
-    except TelegramError as e:
-        raise Exception(f"Telegram推送失败: {str(e)}")
-
-# ====================== 主流程 ======================
-def main():
-    """主执行函数"""
-    print(f"===== 威科夫分析任务启动 {datetime.now()} =====")
-    try:
-        # 1. 获取持仓列表
-        stock_list = get_stock_list_from_sheets()
-        if not stock_list:
-            print("未从Google Sheets获取到持仓数据")
-            send_telegram_message("⚠️ 未检测到持仓数据，任务终止")
-            return
-
-        # 2. 遍历分析每只股票
-        for stock in stock_list:
-            print(f"\n分析股票: {stock['code']} - {stock['name']}")
-            # 获取K线数据
-            kline_df = fetch_stock_data_dynamic(stock["code"], stock["buy_date"])
-            if kline_df.empty:
-                send_telegram_message(f"❌ {stock['code']} {stock['name']} 未获取到K线数据")
+        obj = resp.json()
+        msg = (((obj.get("error", {}) or {}).get("message", "")) or "").lower()
+        if ("quota exceeded" in msg) or ("exceeded your current quota" in msg):
+            return True
+    except:
+        pass
+    return False
+def call_gemini_http(prompt: str) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY missing")
+    model_name = os.getenv("GEMINI_MODEL") or "gemini-1.5-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    session = requests.Session()
+    headers = {"Content-Type": "application/json"}
+    safety_settings = [
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ]
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "system_instruction": {"parts": [{"text": "You are Richard D. Wyckoff."}]},
+        "generationConfig": {"temperature": 0.2},
+        "safetySettings": safety_settings,
+    }
+    max_retries = int(os.getenv("GEMINI_MAX_RETRIES", "8"))
+    base_sleep = float(os.getenv("GEMINI_BASE_SLEEP", "2.5"))
+    timeout_s = int(os.getenv("GEMINI_TIMEOUT", "300"))
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.post(url, headers=headers, json=data, timeout=timeout_s)
+            if resp.status_code == 200:
+                result = resp.json()
+                candidates = result.get("candidates", []) or []
+                if not candidates:
+                    raise ValueError(f"No candidates. Raw={str(result)[:400]}")
+                content = candidates[0].get("content", {}) or {}
+                parts = content.get("parts", []) or []
+                if not parts:
+                    raise ValueError(f"Empty parts. Raw={str(result)[:400]}")
+                text = parts[0].get("text", "") or ""
+                if not text:
+                    raise ValueError(f"Empty text. Raw={str(result)[:400]}")
+                return text
+            if resp.status_code == 429:
+                if _is_quota_exhausted(resp):
+                    raise GeminiQuotaExceeded(resp.text[:1200])
+                retry_s = _extract_retry_seconds(resp)
+                if retry_s <= 0:
+                    retry_s = int(base_sleep * (2 ** (attempt - 1)) + random.random() * 2)
+                if attempt == max_retries:
+                    raise GeminiRateLimited(resp.text[:1200])
+                print(f"   ⚠️ Gemini 429(短期限流)，等待 {retry_s}s 后重试 ({attempt}/{max_retries})", flush=True)
+                time.sleep(retry_s)
                 continue
-            
-            # 生成威科夫分析
-            analysis_result = generate_wyckoff_analysis(stock, kline_df)
-            
-            # 绘制K线图
-            kline_path = f"{stock['code']}_kline.png"
-            plot_kline(stock["code"], kline_df, kline_path)
-            
-            # 推送结果到Telegram
-            msg = f"""
-📈 【{stock['code']} {stock['name']} 威科夫分析报告】
-📅 买入日期: {stock['buy_date'] or '无'}
-💰 持仓成本: ¥{stock['cost']}
-📊 分析结论:
-{analysis_result}
-            """
-            send_telegram_message(msg, kline_path)
-            
-            # 清理临时文件
-            if os.path.exists(kline_path):
-                os.remove(kline_path)
+            if resp.status_code == 503:
+                retry_s = int(base_sleep * (2 ** (attempt - 1)) + random.random() * 2)
+                if attempt == max_retries:
+                    raise Exception(f"Gemini 503 final: {resp.text[:1200]}")
+                print(f"   ⚠️ Gemini 503(过载)，等待 {retry_s}s 后重试 ({attempt}/{max_retries})", flush=True)
+                time.sleep(retry_s)
+                continue
+            raise Exception(f"Gemini HTTP {resp.status_code}: {resp.text[:1200]}")
+        except GeminiQuotaExceeded:
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt == max_retries:
+                raise
+            retry_s = int(base_sleep * (2 ** (attempt - 1)) + random.random() * 2)
+            print(f"   ⚠️ Gemini 调用异常：{str(e)[:200]}... 等待 {retry_s}s 重试 ({attempt}/{max_retries})", flush=True)
+            time.sleep(retry_s)
+    raise last_err or Exception("Gemini unknown failure")
 
-        print(f"\n===== 任务完成 {datetime.now()} =====")
-        send_telegram_message("✅ 所有持仓股票分析完成，报告已推送")
+# ==========================================
+# 新增：硅基流动DeepSeek调用函数（严格按官方示例）
+# ==========================================
+def call_deepseek_siliconflow(prompt: str) -> str:
+    """
+    调用硅基流动DeepSeek API（官方格式）
+    模型：deepseek-ai/DeepSeek-V3.1-Terminus
+    密钥：从环境变量DEEPSEEK_API_KEY获取（已配置在Secrets）
+    """
+    # 1. 获取API密钥
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ValueError("DEEPSEEK_API_KEY missing (请检查GitHub Secrets)")
+    
+    # 2. 官方API地址
+    url = "https://api.siliconflow.cn/v1/chat/completions"
+    
+    # 3. 官方请求头（严格匹配示例）
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    # 4. 请求数据（按官方格式，系统角色设为威科夫分析师）
+    data = {
+        "model": "deepseek-ai/DeepSeek-V3.1-Terminus",  # 官方指定模型名
+        "messages": [
+            {"role": "system", "content": "You are Richard D. Wyckoff. 基于威科夫理论分析股票量价数据，识别Spring、UT、LPS等关键结构，结合用户持仓成本提供Hold/Sell/Stop-Loss建议，分析专业简洁，用中文输出。"},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,  # 与原Gemini保持一致，保证分析稳定
+        "max_tokens": 2048    # 限制最大输出长度
+    }
+    
+    # 5. 发送请求（带重试逻辑，避免网络抖动）
+    session = requests.Session()
+    max_retries = 3
+    base_sleep = 3
+    last_err: Optional[Exception] = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.post(url, headers=headers, json=data, timeout=60)
+            resp.raise_for_status()  # 非200状态码直接抛异常
+            result = resp.json()
+            
+            # 解析返回结果
+            choices = result.get("choices", [])
+            if not choices:
+                raise ValueError(f"DeepSeek返回空结果，原始响应：{str(result)[:400]}")
+            
+            content = choices[0].get("message", {}).get("content", "").strip()
+            if not content:
+                raise ValueError(f"DeepSeek返回空内容，原始响应：{str(result)[:400]}")
+            
+            return content
+        
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            if attempt == max_retries:
+                raise Exception(f"DeepSeek调用失败（{attempt}/{max_retries}次）：{str(e)[:200]}")
+            
+            # 指数退避重试
+            retry_s = base_sleep * (2 ** (attempt - 1))
+            print(f"   ⚠️ DeepSeek调用异常，等待 {retry_s}s 后重试（{attempt}/{max_retries}）", flush=True)
+            time.sleep(retry_s)
+    
+    raise last_err or Exception("DeepSeek未知错误")
 
+# ==========================================
+# 1. 数据获取模块（完全保留原代码，不修改）
+# ==========================================
+def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
+    clean_digits = ''.join(filter(str.isdigit, str(symbol)))
+    symbol_code = clean_digits.zfill(6)
+    start_date_em = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="5", start_date=start_date_em, adjust="qfq")
     except Exception as e:
-        error_msg = f"❌ 任务执行失败: {str(e)}"
-        print(error_msg)
-        send_telegram_message(error_msg)
+        print(f"   [Error] {symbol_code} AkShare接口报错: {e}", flush=True)
+        return {"df": pd.DataFrame(), "period": "5m"}
+    if df.empty:
+        return {"df": pd.DataFrame(), "period": "5m"}
+    rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+    cols = ["open", "high", "low", "close", "volume"]
+    valid_cols = [c for c in cols if c in df.columns]
+    df[valid_cols] = df[valid_cols].astype(float)
+    if "open" in df.columns and (df["open"] == 0).any():
+        df["open"] = df["open"].replace(0, np.nan)
+        if "close" in df.columns:
+            df["open"] = df["open"].fillna(df["close"].shift(1)).fillna(df["close"])
+    if len(df) > 500:
+        df = df.tail(500).reset_index(drop=True)
+    return {"df": df, "period": "5m"}
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "close" in df.columns:
+        df["ma50"] = df["close"].rolling(50).mean()
+        df["ma200"] = df["close"].rolling(200).mean()
+    return df
 
+# ==========================================
+# 2. 绘图模块（完全保留原代码，不修改）
+# ==========================================
+def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: str):
+    if df.empty:
+        return
+    plot_df = df.copy()
+    if "date" in plot_df.columns:
+        plot_df.set_index("date", inplace=True)
+    mc = mpf.make_marketcolors(
+        up='#ff3333',
+        down='#00b060',
+        edge='inherit',
+        wick='inherit',
+        volume={'up': '#ff3333', 'down': '#00b060'},
+        inherit=True
+    )
+    s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc, gridstyle=':', y_on_right=True)
+    apds = []
+    if 'ma50' in plot_df.columns:
+        apds.append(mpf.make_addplot(plot_df['ma50'], color='#ff9900', width=1.5))
+    if 'ma200' in plot_df.columns:
+        apds.append(mpf.make_addplot(plot_df['ma200'], color='#2196f3', width=2.0))
+    try:
+        mpf.plot(
+            plot_df,
+            type='candle',
+            style=s,
+            addplot=apds,
+            volume=True,
+            title=f"Wyckoff: {symbol} ({period} | {len(plot_df)} bars)",
+            savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'),
+            warn_too_much_data=2000
+        )
+    except Exception as e:
+        print(f"   [Error] {symbol} 绘图失败: {e}", flush=True)
+
+# ==========================================
+# 3. AI 分析模块（核心修改：优先调用DeepSeek）
+# ==========================================
+_PROMPT_CACHE = None
+def get_prompt_content(symbol, df, position_info):
+    global _PROMPT_CACHE
+    if _PROMPT_CACHE is None:
+        prompt_template = os.getenv("WYCKOFF_PROMPT_TEMPLATE")
+        if not prompt_template and os.path.exists("prompt_secret.txt"):
+            try:
+                with open("prompt_secret.txt", "r", encoding="utf-8") as f:
+                    prompt_template = f.read()
+            except:
+                prompt_template = None
+        _PROMPT_CACHE = prompt_template
+    prompt_template = _PROMPT_CACHE
+    if not prompt_template:
+        return None
+    csv_data = df.to_csv(index=False)
+    latest = df.iloc[-1]
+    base_prompt = (
+        prompt_template.replace("{symbol}", symbol)
+        .replace("{latest_time}", str(latest["date"]))
+        .replace("{latest_price}", str(latest["close"]))
+        .replace("{csv_data}", csv_data)
+    )
+    def safe_get(key):
+        val = position_info.get(key)
+        if val is None or str(val).lower() == 'nan' or str(val).strip() == '':
+            return 'N/A'
+        return val
+    buy_date = safe_get('date')
+    buy_price = safe_get('price')
+    qty = safe_get('qty')
+    position_text = (
+        f"\n\n[USER POSITION DATA]\n"
+        f"Symbol: {symbol}\n"
+        f"Buy Date: {buy_date}\n"
+        f"Cost Price: {buy_price}\n"
+        f"Quantity: {qty}\n"
+        f"(Note: Please analyze the current trend based on this position data. If position data is N/A, analyze as a potential new entry.)"
+    )
+    return base_prompt + position_text
+def call_openai_official(prompt: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OpenAI Key missing")
+    model_name = os.getenv("AI_MODEL", "gpt-4o")
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": "You are Richard D. Wyckoff."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
+    )
+    return resp.choices[0].message.content
+
+# 核心修改：AI分析逻辑优先调用DeepSeek
+def ai_analyze(symbol, df, position_info):
+    prompt = get_prompt_content(symbol, df, position_info)
+    if not prompt:
+        return "Error: No Prompt"
+    # 1. 优先调用硅基流动DeepSeek（替换原Gemini优先逻辑）
+    try:
+        print(f"   🧠 正在调用 DeepSeek（硅基流动）分析 {symbol}...", flush=True)
+        return call_deepseek_siliconflow(prompt)
+    except Exception as e1:
+        print(f"   ⚠️ DeepSeek调用失败，尝试切换到Gemini: {str(e1)[:150]}...", flush=True)
+        # 2. DeepSeek失败后，保留原Gemini/OpenAI兜底逻辑
+        try:
+            return call_gemini_http(prompt)
+        except GeminiQuotaExceeded as qe:
+            print(f"   ⚠️ [{symbol}] Gemini 配额耗尽，切 OpenAI: {str(qe)[:160]}...", flush=True)
+            try:
+                return call_openai_official(prompt)
+            except Exception as e2:
+                return f"Analysis Failed. DeepSeek Error: {e1}. Gemini Quota Error: {qe}. OpenAI Error: {e2}"
+        except GeminiRateLimited as rl:
+            print(f"   ⚠️ [{symbol}] Gemini 短期限流，切 OpenAI: {str(rl)[:160]}...", flush=True)
+            try:
+                return call_openai_official(prompt)
+            except Exception as e2:
+                return f"Analysis Failed. DeepSeek Error: {e1}. Gemini RateLimit Error: {rl}. OpenAI Error: {e2}"
+        except Exception as e2:
+            print(f"   ⚠️ [{symbol}] Gemini 失败，切 OpenAI: {str(e2)[:160]}...", flush=True)
+            try:
+                return call_openai_official(prompt)
+            except Exception as e3:
+                return f"Analysis Failed. DeepSeek Error: {e1}. Gemini Error: {e2}. OpenAI Error: {e3}"
+
+# ==========================================
+# 4. PDF 生成模块（完全保留原代码，不修改）
+# ==========================================
+def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
+    html_content = markdown.markdown(report_text)
+    abs_chart_path = os.path.abspath(chart_path)
+    font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
+    if not os.path.exists(font_path):
+        font_path = "msyh.ttc"
+    full_html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            @font-face {{ font-family: "MyChineseFont"; src: url("{font_path}"); }}
+            @page {{ size: A4; margin: 1cm; }}
+            body {{ font-family: "MyChineseFont", sans-serif; font-size: 12px; line-height: 1.5; }}
+            h1, h2, h3, p, div {{ font-family: "MyChineseFont", sans-serif; color: #2c3e50; }}
+            img {{ width: 18cm; margin-bottom: 20px; }}
+            .header {{ text-align: center; margin-bottom: 20px; color: #7f8c8d; font-size: 10px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">Wyckoff Quantitative Analysis | {symbol}</div>
+        <img src="{abs_chart_path}" />
+        <hr/>
+        {html_content}
+    </body>
+    </html>
+    """
+    try:
+        with open(pdf_path, "wb") as pdf_file:
+            pisa.CreatePDF(full_html, dest=pdf_file)
+        return True
+    except:
+        return False
+
+# ==========================================
+# 5. 主程序（完全保留原代码，不修改）
+# ==========================================
+def process_one_stock(symbol: str, position_info: dict):
+    if position_info is None:
+        position_info = {}
+    clean_digits = ''.join(filter(str.isdigit, str(symbol)))
+    clean_symbol = clean_digits.zfill(6)
+    print(f"🚀 [{clean_symbol}] 开始分析...", flush=True)
+    data_res = fetch_stock_data_dynamic(clean_symbol, position_info.get('date'))
+    df = data_res["df"]
+    period = data_res["period"]
+    if df.empty:
+        print(f"   ⚠️ [{clean_symbol}] 数据为空，跳过", flush=True)
+        return None
+    df = add_indicators(df)
+    beijing_tz = timezone(timedelta(hours=8))
+    ts = datetime.now(beijing_tz).strftime("%Y%m%d_%H%M%S")
+    csv_path = f"data/{clean_symbol}_{period}_{ts}.csv"
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    chart_path = f"reports/{clean_symbol}_chart_{ts}.png"
+    pdf_path = f"reports/{clean_symbol}_report_{period}_{ts}.pdf"
+    generate_local_chart(clean_symbol, df, chart_path, period)
+    report_text = ai_analyze(clean_symbol, df, position_info)
+    if generate_pdf_report(clean_symbol, chart_path, report_text, pdf_path):
+        print(f"✅ [{clean_symbol}] 报告生成完毕", flush=True)
+        return pdf_path
+    return None
+def main():
+    os.makedirs("data", exist_ok=True)
+    os.makedirs("reports", exist_ok=True)
+    print("☁️ 正在连接 Google Sheets...", flush=True)
+    try:
+        sm = SheetManager()
+        stocks_dict = sm.get_all_stocks()
+        print(f"📋 获取 {len(stocks_dict)} 个任务", flush=True)
+    except Exception as e:
+        print(f"❌ Sheet 连接失败: {e}", flush=True)
+        return
+    generated_pdfs = []
+    items = list(stocks_dict.items())
+    for i, (symbol, info) in enumerate(items):
+        try:
+            pdf_path = process_one_stock(symbol, info)
+            if pdf_path:
+                generated_pdfs.append(pdf_path)
+        except Exception as e:
+            print(f"❌ [{symbol}] 处理发生异常: {e}", flush=True)
+        if i < len(items) - 1:
+            print("⏳ 强制冷却 60秒 (防止 API 429)...", flush=True)
+            time.sleep(60)
+    if generated_pdfs:
+        print(f"\n📝 生成推送清单 ({len(generated_pdfs)}):", flush=True)
+        with open("push_list.txt", "w", encoding="utf-8") as f:
+            for pdf in generated_pdfs:
+                print(f"   -> {pdf}")
+                f.write(f"{pdf}\n")
+    else:
+        print("\n⚠️ 无报告生成", flush=True)
 if __name__ == "__main__":
     main()
