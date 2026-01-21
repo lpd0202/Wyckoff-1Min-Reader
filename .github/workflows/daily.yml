@@ -1,76 +1,93 @@
 name: Daily Stock AI Report
-
-# 触发规则：北京时间12:00（UTC+4）、15:15（UTC+7:15），周一到周五；保留手动触发
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '0 4 * * 1-5'    # 北京时间 12:00（UTC+8 → UTC 4:00），午盘分析
-    - cron: '15 7 * * 1-5'   # 北京时间 15:15（UTC+8 → UTC 7:15），收盘分析
-  workflow_dispatch:          # 手动触发（紧急分析/测试）
-
-# 并发控制：避免重复运行导致资源冲突
+    - cron: "0 4 * * *"   # 北京时间 12:00
+    - cron: "15 7 * * *"  # 北京时间 15:15
+permissions:
+  contents: write
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: stock-ai-report-main
   cancel-in-progress: true
-
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
-    # 设置超时时间（适配AI 120秒超时需求）
-    timeout-minutes: 30
     steps:
-      - name: Checkout code
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 仅拉取最新代码，加速流程
-
-      - name: Set up Python 3.11
+          fetch-depth: 0
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-wqy-microhei ttf-wqy-microhei libcairo2-dev pkg-config python3-dev
+          fc-cache -f -v
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'    # 缓存pip依赖，加速安装
-
-      - name: Install system dependencies
+          python-version: "3.11"
+      - name: Install dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            libcairo2-dev pkg-config \
-            libfreetype6-dev libpng-dev libjpeg-dev  # 补充绘图依赖（Mplfinance）
-          sudo apt-get clean  # 清理缓存，减少空间占用
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
-          # 验证依赖安装（可选，便于调试）
-          pip list | grep -E "gemini|openai|akshare|mplfinance|python-telegram-bot"
-
-      - name: Run main script (Wyckoff AI Analysis)
+          python -m pip install --upgrade pip
+          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread google-auth
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Run Analysis Script
         env:
-          # 原有环境变量
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-3-flash-preview"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AI_MODEL: "gpt-4o"
+          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
+          BARS_COUNT: "600"
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          # 新增：传递DeepSeek密钥（与Secrets名称一致）
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          mkdir -p data reports
+          python main.py
+      - name: Cleanup old data
+        run: |
+          echo "Cleaning up files older than 7 days..."
+          find reports/ -name "*.*" -type f -mtime +7 -print -delete
+          find data/ -name "*.csv" -type f -mtime +7 -print -delete
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add --all
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: daily report $(date +'%Y-%m-%d')"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+      - name: Notify Telegram (Push List)
+        if: success()
+        env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
-          # 新增 DeepSeek 密钥
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # 补充项目核心环境变量（适配AI超时/安全策略）
-          AI_REQUEST_TIMEOUT: 120
-          GEMINI_SAFETY_POLICY: BLOCK_NONE
+        shell: bash
         run: |
-          # 创建报告目录（防止脚本执行时目录不存在）
-          mkdir -p reports
-          # 执行主脚本并输出日志（便于调试）
-          python main.py 2>&1 | tee reports/execution.log
-
-      - name: Upload reports and logs
-        uses: actions/upload-artifact@v4
-        if: always()  # 即使脚本执行失败，也上传报告/日志用于排查
-        with:
-          name: stock-reports
-          path: |
-            reports/
-            *.log  # 包含执行日志
-          retention-days: 7  # artifact 保留7天，节省存储空间
+          set -u
+          if [ ! -f push_list.txt ]; then
+            echo "::warning::File push_list.txt not found."
+            exit 0
+          fi
+          
+          echo "=== Start Pushing ==="
+          while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
+            PDF_FILE=$(echo "$PDF_FILE" | xargs)
+            if [ -n "$PDF_FILE" ] && [ -f "$PDF_FILE" ]; then
+              echo "Sending: $PDF_FILE"
+              FILENAME=$(basename "$PDF_FILE")
+              CAPTION="Analysis: $FILENAME"
+              
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" -F "chat_id=${TG_CHAT_ID}" -F "document=@$PDF_FILE" -F "caption=$CAPTION"
+                
+              echo "Sent."
+              sleep 3
+            fi
+          done < push_list.txt
+          echo "=== Finished ==="
