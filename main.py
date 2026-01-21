@@ -6,30 +6,28 @@ import akshare as ak
 import mplfinance as mpf
 import pandas as pd
 from datetime import datetime, timedelta
-import telegram
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from fpdf import FPDF
 
 # ===================== 全局配置 =====================
 # 轨迹流动 API 配置
-SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY")
+SILICONFLOW_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 对应你之前配置的Secret名称
 SILICONFLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V3.1-Terminus"
 
-# Telegram 配置
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 # Google Sheets 配置
-GOOGLE_CREDENTIALS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_CREDENTIALS = json.loads(os.getenv("GCP_SA_KEY"))  # 对应原Secret名称
+SPREADSHEET_ID = os.getenv("SHEET_NAME")  # 对应原Secret名称
 
 # 全局参数
 TIMEOUT = 120  # API 请求超时时间
 STOCK_CODE_ZFILL = 6  # 股票代码补零位数
 ANALYSIS_WINDOW_DAYS = 15  # 分析窗口天数
+OUTPUT_DIR = "reports"  # 报告输出目录
+
+# 确保输出目录存在
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ===================== 工具函数 =====================
 def format_stock_code(stock_code: str) -> str:
@@ -174,14 +172,12 @@ def deepseek_ai_analysis(stock_data_str: str, position_info: str) -> str:
         raise Exception(f"DeepSeek API 调用失败: {str(e)}")
 
 def generate_pdf_report(analysis_result: str, kline_img_path: str, report_path: str):
-    """生成包含分析结论和K线图的PDF研报（简化版，可扩展ReportLab）"""
-    from fpdf import FPDF
-
+    """生成包含分析结论和K线图的PDF研报"""
     pdf = FPDF()
     pdf.add_page()
     
-    # 设置字体
-    pdf.add_font("SimHei", "", "SimHei.ttf", uni=True)
+    # 设置字体（需确保环境有中文字体，GitHub Actions的Ubuntu可安装wqy-microhei）
+    pdf.add_font("SimHei", "", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", uni=True)
     pdf.set_font("SimHei", size=12)
     
     # 添加标题
@@ -199,18 +195,8 @@ def generate_pdf_report(analysis_result: str, kline_img_path: str, report_path: 
     # 保存PDF
     pdf.output(report_path)
 
-async def send_telegram_message(content: str, file_path: str = None):
-    """发送消息/文件到Telegram"""
-    bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-    # 发送文本
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=content)
-    # 发送PDF报告
-    if file_path and os.path.exists(file_path):
-        with open(file_path, "rb") as f:
-            await bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=f)
-
 # ===================== 核心业务逻辑 =====================
-async def analyze_single_stock(stock_code: str, position_info: dict):
+def analyze_single_stock(stock_code: str, position_info: dict):
     """分析单只股票并生成报告"""
     try:
         # 1. 获取股票数据
@@ -219,11 +205,11 @@ async def analyze_single_stock(stock_code: str, position_info: dict):
             buy_date=position_info.get("买入日期")
         )
         if stock_df.empty:
-            await send_telegram_message(f"⚠️ {stock_code} 未获取到有效K线数据")
+            print(f"⚠️ {stock_code} 未获取到有效K线数据")
             return
         
         # 2. 绘制K线图
-        kline_img_path = f"{stock_code}_kline.png"
+        kline_img_path = os.path.join(OUTPUT_DIR, f"{stock_code}_kline.png")
         plot_kline(stock_df, stock_code, kline_img_path)
         
         # 3. 格式化数据供AI分析
@@ -231,35 +217,28 @@ async def analyze_single_stock(stock_code: str, position_info: dict):
         position_info_str = json.dumps(position_info, ensure_ascii=False, indent=2)
         
         # 4. DeepSeek AI分析
+        print(f"🧠 正在分析 {stock_code}...")
         analysis_result = deepseek_ai_analysis(stock_data_str, position_info_str)
         
         # 5. 生成PDF报告
-        report_path = f"{stock_code}_wyckoff_report.pdf"
+        report_path = os.path.join(OUTPUT_DIR, f"{stock_code}_wyckoff_report.pdf")
         generate_pdf_report(analysis_result, kline_img_path, report_path)
         
-        # 6. 推送至Telegram
-        await send_telegram_message(
-            content=f"✅ {stock_code} 威科夫分析完成：\n{analysis_result[:500]}...",
-            file_path=report_path
-        )
+        print(f"✅ {stock_code} 分析完成，报告已保存至：{report_path}")
         
-        # 清理临时文件
-        for tmp_file in [kline_img_path, report_path]:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-                
     except Exception as e:
-        await send_telegram_message(f"❌ {stock_code} 分析失败：{str(e)}")
+        print(f"❌ {stock_code} 分析失败：{str(e)}")
 
-async def batch_analyze_stocks():
+def batch_analyze_stocks():
     """批量分析Google Sheets中的股票"""
     try:
         # 读取持仓列表
         stock_df = get_google_sheets_data()
         if stock_df.empty:
-            await send_telegram_message("⚠️ Google Sheets 未读取到持仓数据")
+            print("⚠️ Google Sheets 未读取到持仓数据")
             return
         
+        print(f"📋 开始分析 {len(stock_df)} 只股票...")
         # 遍历分析每只股票
         for _, row in stock_df.iterrows():
             position_info = {
@@ -268,7 +247,7 @@ async def batch_analyze_stocks():
                 "持仓成本": row.get("持仓成本"),
                 "持仓数量": row.get("持仓数量")
             }
-            await analyze_single_stock(
+            analyze_single_stock(
                 stock_code=position_info["股票代码"],
                 position_info=position_info
             )
@@ -276,47 +255,8 @@ async def batch_analyze_stocks():
             time.sleep(5)
             
     except Exception as e:
-        await send_telegram_message(f"❌ 批量分析失败：{str(e)}")
-
-# ===================== Telegram Bot 指令处理 =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /start 指令"""
-    await update.message.reply_text("📈 Wyckoff-M1-Sentinel 已启动\n指令列表：\n/analyze - 立即执行批量分析\n/refresh - 同步Google Sheets数据")
-
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /analyze 指令：立即执行分析"""
-    await update.message.reply_text("🔍 开始批量分析股票，请稍候...")
-    await batch_analyze_stocks()
-    await update.message.reply_text("✅ 批量分析完成，报告已推送！")
-
-async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /refresh 指令：同步Google Sheets数据"""
-    try:
-        stock_df = get_google_sheets_data()
-        await update.message.reply_text(f"🔄 同步完成！当前监控股票数量：{len(stock_df)}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ 同步失败：{str(e)}")
-
-def run_telegram_bot():
-    """启动Telegram Bot"""
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # 注册指令处理器
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("analyze", cmd_analyze))
-    application.add_handler(CommandHandler("refresh", cmd_refresh))
-    
-    # 启动Bot
-    application.run_polling()
+        print(f"❌ 批量分析失败：{str(e)}")
 
 # ===================== 主入口 =====================
 if __name__ == "__main__":
-    # 优先级：1. 执行批量分析 2. 启动Telegram Bot
-    mode = os.getenv("RUN_MODE", "batch")  # 通过环境变量控制运行模式
-    if mode == "batch":
-        # 非阻塞运行批量分析（适配GitHub Actions）
-        import asyncio
-        asyncio.run(batch_analyze_stocks())
-    elif mode == "bot":
-        # 启动Telegram Bot（持续运行）
-        run_telegram_bot()
+    batch_analyze_stocks()
