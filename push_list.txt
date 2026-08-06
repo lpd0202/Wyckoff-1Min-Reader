@@ -1,2 +1,1 @@
-reports/000823_report_5m_20260805_143909.pdf
-reports/000529_report_5m_20260805_144035.pdf
+reports/000529_report_5m_20260806_143823.pdf
